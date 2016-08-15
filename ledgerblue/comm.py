@@ -21,8 +21,24 @@ from abc import ABCMeta, abstractmethod
 from .commException import CommException
 from .ledgerWrapper import wrapCommandAPDU, unwrapResponseAPDU
 from binascii import hexlify
-import hid
+try:
+	import pywinusb.hid as hid
+	global windowsusb
+	windowsusb = True
+except:
+	pass
+try:
+	import hid
+	global windowsusb
+	windowsusb = False
+except:
+	pass
+assert ('windowsusb' in globals())
 import time
+
+def data_rx_handler(data):
+	global resultin
+	resultin.extend(data[1:])
 
 try:
 	from smartcard.Exceptions import NoCardException
@@ -72,10 +88,17 @@ class HIDDongleHIDAPI(Dongle, DongleWait):
 		if padSize <> 0:
 			tmp.extend([0] * (64 - padSize))
 		offset = 0
+		global resultin
+		resultin = []
+		if windowsusb:
+			self.device.set_raw_data_handler(data_rx_handler)
 		while(offset <> len(tmp)):
 			data = tmp[offset:offset + 64]
 			data = bytearray([0]) + data
-			self.device.write(data)
+			if windowsusb:
+				self.device.send_output_report(data)
+			else:
+				self.device.write(data)
 			offset += 64
 		dataLength = 0
 		dataStart = 2		
@@ -100,17 +123,25 @@ class HIDDongleHIDAPI(Dongle, DongleWait):
 			else:
 				swOffset = 0
 		else:
-			self.device.set_nonblocking(False)
+			if not windowsusb:
+				self.device.set_nonblocking(False)
 			while True:
-				response = unwrapResponseAPDU(0x0101, result, 64)
+				if windowsusb:
+					response = unwrapResponseAPDU(0x0101, bytearray(resultin), 64)
+				else:
+					response = unwrapResponseAPDU(0x0101, result, 64)
 				if response is not None:
 					result = response
 					dataStart = 0
 					swOffset = len(response) - 2
 					dataLength = len(response) - 2
-					self.device.set_nonblocking(True)
+					if windowsusb:
+						result = bytearray(result)
+					else:
+						self.device.set_nonblocking(True)
 					break
-				result.extend(bytearray(self.device.read(65)))
+				if not windowsusb:
+					result.extend(bytearray(self.device.read(65)))
 		sw = (result[swOffset] << 8) + result[swOffset + 1]
 		response = result[dataStart : dataLength + dataStart]
 		if self.debug:
@@ -121,15 +152,22 @@ class HIDDongleHIDAPI(Dongle, DongleWait):
 
 	def waitFirstResponse(self, timeout):
 		start = time.time()
-		data = ""
-		while len(data) == 0:
-			data = self.device.read(65)
-			if not len(data):
+		if windowsusb:
+			while resultin==[]:
 				if time.time() - start > timeout:
 					raise CommException("Timeout")
-				time.sleep(0.02)
-		return bytearray(data)
-
+				time.sleep(0.2)
+			time.sleep(0.5)
+		else:
+			data = ""
+			while len(data) == 0:
+				data = self.device.read(65)
+				if not len(data):
+					if time.time() - start > timeout:
+						raise CommException("Timeout")
+					time.sleep(0.02)
+			return bytearray(data)
+	
 	def close(self):
 		if self.opened:
 			try:
@@ -169,14 +207,21 @@ def getDongle(debug=False, selectCommand=None):
 	dev = None
 	hidDevicePath = None
 	ledger = True
-	for hidDevice in hid.enumerate(0, 0):
-		if hidDevice['vendor_id'] == 0x2c97:
-			hidDevicePath = hidDevice['path']
-	if hidDevicePath is not None:
-		dev = hid.device()
-		dev.open_path(hidDevicePath)
-		dev.set_nonblocking(True)
-		return HIDDongleHIDAPI(dev, ledger, debug)
+	if windowsusb:
+		devlist = hid.HidDeviceFilter(vendor_id = 0x2c97).get_devices()
+		if devlist != {} and devlist != []:
+			dev = devlist[0]
+			dev.open()
+			return HIDDongleHIDAPI(dev, ledger, debug)
+	else:
+		for hidDevice in hid.enumerate(0, 0):
+				if hidDevice['vendor_id'] == 0x2c97:
+					hidDevicePath = hidDevice['path']
+		if hidDevicePath is not None:
+			dev = hid.device()
+			dev.open_path(hidDevicePath)
+			dev.set_nonblocking(True)
+			return HIDDongleHIDAPI(dev, ledger, debug)
 	if SCARD:
 		connection = None
 		for reader in readers():
